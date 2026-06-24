@@ -1,35 +1,28 @@
-# pip install -U langchain langchain-openai langchain-community faiss-cpu pypdf python-dotenv langsmith
-
 import os
 from dotenv import load_dotenv
-
-from langsmith import traceable  # <-- key import
-
+from langsmith import traceable
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_nvidia_ai_endpoints import ChatNVIDIA, NVIDIAEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 
-# --- LangSmith env (make sure these are set) ---
-# LANGCHAIN_TRACING_V2=true
-# LANGCHAIN_API_KEY=...
-# LANGCHAIN_PROJECT=pdf_rag_demo
-
 load_dotenv()
+api_key = os.getenv("KIMI_API_KEY")
+os.environ['LANGCHAIN_PROJECT'] = 'RAG Example'
 
-PDF_PATH = "islr.pdf"  # change to your file
+PDF_PATH = "islr.pdf"
 
 # ---------- traced setup steps ----------
 @traceable(name="load_pdf")
 def load_pdf(path: str):
     loader = PyPDFLoader(path)
-    return loader.load()  # list[Document]
+    return loader.load()
 
 @traceable(name="split_documents")
-def split_documents(docs, chunk_size=1000, chunk_overlap=150):
+def split_documents(docs, chunk_size=750, chunk_overlap=150):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=chunk_overlap
     )
@@ -37,12 +30,12 @@ def split_documents(docs, chunk_size=1000, chunk_overlap=150):
 
 @traceable(name="build_vectorstore")
 def build_vectorstore(splits):
-    emb = OpenAIEmbeddings(model="text-embedding-3-small")
-    # FAISS.from_documents internally calls the embedding model:
-    vs = FAISS.from_documents(splits, emb)
-    return vs
+    emb = NVIDIAEmbeddings(
+        model="nvidia/llama-nemotron-embed-1b-v2",
+        api_key=api_key
+    )
+    return FAISS.from_documents(splits, emb)
 
-# You can also trace a “setup” umbrella span if you want:
 @traceable(name="setup_pipeline")
 def setup_pipeline(pdf_path: str):
     docs = load_pdf(pdf_path)
@@ -51,35 +44,40 @@ def setup_pipeline(pdf_path: str):
     return vs
 
 # ---------- pipeline ----------
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm = ChatNVIDIA(
+    model="meta/llama-3.3-70b-instruct",
+    api_key=api_key
+)
 
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "Answer ONLY from the provided context. If not found, say you don't know."),
+    ("system", """Answer ONLY from the provided context. 
+If the question is not related to the context, say 'This question is outside the scope of the document.'
+Do not use any outside knowledge."""),
     ("human", "Question: {question}\n\nContext:\n{context}")
 ])
 
-def format_docs(docs):
-    return "\n\n".join(d.page_content for d in docs)
+def format_docs(docs): return "\n\n".join(d.page_content for d in docs)
 
-# Build the index under traced setup
 vectorstore = setup_pipeline(PDF_PATH)
 retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": 4})
 
 parallel = RunnableParallel({
     "context": retriever | RunnableLambda(format_docs),
-    "question": RunnablePassthrough(),
+    "question": RunnablePassthrough()
 })
 
 chain = parallel | prompt | llm | StrOutputParser()
 
-# ---------- run a query (also traced) ----------
+# ---------- run queries ----------
 print("PDF RAG ready. Ask a question (or Ctrl+C to exit).")
-q = input("\nQ: ").strip()
-
-# Give the visible run name + tags/metadata so it’s easy to find:
-config = {
-    "run_name": "pdf_rag_query"
-}
-
-ans = chain.invoke(q, config=config)
-print("\nA:", ans)
+while True:
+    try:
+        q = input("\nQ: ").strip()
+        if not q:
+            continue
+        config = {"run_name": "pdf_rag_query"}
+        ans = chain.invoke(q, config=config)
+        print("\nA:", ans)
+    except KeyboardInterrupt:
+        print("\nExiting...")
+        break
