@@ -1,5 +1,3 @@
-# pip install -U langchain langchain-openai langchain-community faiss-cpu pypdf python-dotenv langsmith
-
 import os
 import json
 import hashlib
@@ -10,25 +8,27 @@ from langsmith import traceable
 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_nvidia_ai_endpoints import ChatNVIDIA, NVIDIAEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnableParallel, RunnablePassthrough, RunnableLambda
 from langchain_core.output_parsers import StrOutputParser
 
 load_dotenv()
+api_key = os.getenv("KIMI_API_KEY")
+os.environ['LANGCHAIN_PROJECT'] = 'RAG Example 3'
 
-PDF_PATH = "islr.pdf"  # change to your file
+PDF_PATH = "islr.pdf"
 INDEX_ROOT = Path(".indices")
 INDEX_ROOT.mkdir(exist_ok=True)
 
 # ----------------- helpers (traced) -----------------
 @traceable(name="load_pdf")
 def load_pdf(path: str):
-    return PyPDFLoader(path).load()  # list[Document]
+    return PyPDFLoader(path).load()
 
 @traceable(name="split_documents")
-def split_documents(docs, chunk_size=1000, chunk_overlap=150):
+def split_documents(docs, chunk_size=750, chunk_overlap=150):
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size, chunk_overlap=chunk_overlap
     )
@@ -36,7 +36,7 @@ def split_documents(docs, chunk_size=1000, chunk_overlap=150):
 
 @traceable(name="build_vectorstore")
 def build_vectorstore(splits, embed_model_name: str):
-    emb = OpenAIEmbeddings(model=embed_model_name)
+    emb = NVIDIAEmbeddings(model=embed_model_name, api_key=api_key)
     return FAISS.from_documents(splits, emb)
 
 # ----------------- cache key / fingerprint -----------------
@@ -61,7 +61,7 @@ def _index_key(pdf_path: str, chunk_size: int, chunk_overlap: int, embed_model_n
 # ----------------- explicitly traced load/build runs -----------------
 @traceable(name="load_index", tags=["index"])
 def load_index_run(index_dir: Path, embed_model_name: str):
-    emb = OpenAIEmbeddings(model=embed_model_name)
+    emb = NVIDIAEmbeddings(model=embed_model_name, api_key=api_key)
     return FAISS.load_local(
         str(index_dir),
         emb,
@@ -70,9 +70,9 @@ def load_index_run(index_dir: Path, embed_model_name: str):
 
 @traceable(name="build_index", tags=["index"])
 def build_index_run(pdf_path: str, index_dir: Path, chunk_size: int, chunk_overlap: int, embed_model_name: str):
-    docs = load_pdf(pdf_path)  # child
-    splits = split_documents(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)  # child
-    vs = build_vectorstore(splits, embed_model_name)  # child
+    docs = load_pdf(pdf_path)
+    splits = split_documents(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    vs = build_vectorstore(splits, embed_model_name)
     index_dir.mkdir(parents=True, exist_ok=True)
     vs.save_local(str(index_dir))
     (index_dir / "meta.json").write_text(json.dumps({
@@ -83,27 +83,34 @@ def build_index_run(pdf_path: str, index_dir: Path, chunk_size: int, chunk_overl
     }, indent=2))
     return vs
 
-# ----------------- dispatcher (not traced) -----------------
+# ----------------- dispatcher -----------------
 def load_or_build_index(
     pdf_path: str,
-    chunk_size: int = 1000,
+    chunk_size: int = 750,
     chunk_overlap: int = 150,
-    embed_model_name: str = "text-embedding-3-small",
+    embed_model_name: str = "nvidia/llama-nemotron-embed-1b-v2",
     force_rebuild: bool = False,
 ):
     key = _index_key(pdf_path, chunk_size, chunk_overlap, embed_model_name)
     index_dir = INDEX_ROOT / key
     cache_hit = index_dir.exists() and not force_rebuild
     if cache_hit:
+        print("Loading cached index...")
         return load_index_run(index_dir, embed_model_name)
     else:
+        print("Building index...")
         return build_index_run(pdf_path, index_dir, chunk_size, chunk_overlap, embed_model_name)
 
-# ----------------- model, prompt, and pipeline -----------------
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+# ----------------- model, prompt, pipeline -----------------
+llm = ChatNVIDIA(
+    model="meta/llama-3.3-70b-instruct",
+    nvidia_api_key=api_key
+)
 
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "Answer ONLY from the provided context. If not found, say you don't know."),
+    ("system", """Answer ONLY from the provided context. 
+If the question is not related to the context, say 'This question is outside the scope of the document.'
+Do not use any outside knowledge."""),
     ("human", "Question: {question}\n\nContext:\n{context}")
 ])
 
@@ -111,7 +118,13 @@ def format_docs(docs):
     return "\n\n".join(d.page_content for d in docs)
 
 @traceable(name="setup_pipeline", tags=["setup"])
-def setup_pipeline(pdf_path: str, chunk_size=1000, chunk_overlap=150, embed_model_name="text-embedding-3-small", force_rebuild=False):
+def setup_pipeline(
+    pdf_path: str,
+    chunk_size=750,
+    chunk_overlap=150,
+    embed_model_name="nvidia/llama-nemotron-embed-1b-v2",
+    force_rebuild=False
+):
     return load_or_build_index(
         pdf_path=pdf_path,
         chunk_size=chunk_size,
@@ -124,9 +137,9 @@ def setup_pipeline(pdf_path: str, chunk_size=1000, chunk_overlap=150, embed_mode
 def setup_pipeline_and_query(
     pdf_path: str,
     question: str,
-    chunk_size: int = 1000,
+    chunk_size: int = 750,
     chunk_overlap: int = 150,
-    embed_model_name: str = "text-embedding-3-small",
+    embed_model_name: str = "nvidia/llama-nemotron-embed-1b-v2",
     force_rebuild: bool = False,
 ):
     vectorstore = setup_pipeline(pdf_path, chunk_size, chunk_overlap, embed_model_name, force_rebuild)
@@ -146,6 +159,13 @@ def setup_pipeline_and_query(
 # ----------------- CLI -----------------
 if __name__ == "__main__":
     print("PDF RAG ready. Ask a question (or Ctrl+C to exit).")
-    q = input("\nQ: ").strip()
-    ans = setup_pipeline_and_query(PDF_PATH, q)
-    print("\nA:", ans)
+    while True:
+        try:
+            q = input("\nQ: ").strip()
+            if not q:
+                continue
+            ans = setup_pipeline_and_query(PDF_PATH, q)
+            print("\nA:", ans)
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            break
